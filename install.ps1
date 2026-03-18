@@ -1,16 +1,21 @@
 <#
 .SYNOPSIS
-    Installs or updates Bob — the agent orchestrator.
+    Installs or updates Bob — the agent orchestrator — and its CLI agent prerequisites.
 
 .DESCRIPTION
     Downloads and installs the latest (or specified) version of Bob from GitHub releases.
     Supports silent installation, architecture detection, version comparison, and checksum verification.
+    After installing Bob, automatically installs/verifies CLI tools: Git, Node.js, GitHub CLI,
+    Claude Code, Copilot CLI, Codex CLI, and Gemini CLI.
 
 .PARAMETER Version
     Install a specific version (e.g., "1.2.0" or "v1.2.0"). Defaults to latest.
 
 .PARAMETER Force
     Reinstall even if the current version is already up-to-date.
+
+.PARAMETER SkipPrereqs
+    Skip installation of CLI agent prerequisites (Git, Node.js, GitHub CLI, Claude Code, etc.).
 
 .EXAMPLE
     # Install latest version:
@@ -21,7 +26,8 @@
 #>
 param(
     [string]$Version,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$SkipPrereqs
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,8 +98,8 @@ function Show-Banner {
     Write-Host "            |" -ForegroundColor Cyan
     Write-Host "  +==============================+" -ForegroundColor Cyan
     Write-Host "  |  " -ForegroundColor Cyan -NoNewline
-    Write-Host "The agent orchestrator" -ForegroundColor DarkGray -NoNewline
-    Write-Host "       |" -ForegroundColor Cyan
+    Write-Host "Bob + CLI agents" -ForegroundColor DarkGray -NoNewline
+    Write-Host "          |" -ForegroundColor Cyan
     Write-Host "  +==============================+" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -399,6 +405,501 @@ function Format-FileSize {
     return "$Bytes B"
 }
 
+# ─── Prerequisites ─────────────────────────────────────────────────────────────
+
+function Refresh-Path {
+    $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+}
+
+function Test-CommandExists {
+    param([string]$Command)
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    $result = $false
+    try {
+        if (Get-Command $Command -ErrorAction SilentlyContinue) { $result = $true }
+    } catch {}
+    $ErrorActionPreference = $old
+    return $result
+}
+
+function Get-CommandVersion {
+    param([string]$Command, [string[]]$Args = @('--version'))
+    try {
+        $output = & $Command @Args 2>&1 | Out-String
+        if ($output -match '(\d+\.\d+[\.\d]*)') {
+            return $Matches[1]
+        }
+    } catch {}
+    return $null
+}
+
+function Add-ToUserPath {
+    <#
+        Adds a directory to the user PATH permanently and for the current session.
+        Returns $true if the path was added, $false if it was already present.
+    #>
+    param([string]$Directory)
+    if (-not $Directory -or -not (Test-Path $Directory)) { return $false }
+    # Check if already in current session PATH
+    $pathDirs = $env:Path -split ';' | Where-Object { $_ }
+    foreach ($d in $pathDirs) {
+        try {
+            if ([System.IO.Path]::GetFullPath($d) -eq [System.IO.Path]::GetFullPath($Directory)) {
+                return $false
+            }
+        } catch { }
+    }
+    # Add to user PATH permanently
+    $userPath = [System.Environment]::GetEnvironmentVariable('Path', 'User')
+    if (-not $userPath) { $userPath = '' }
+    $userDirs = $userPath -split ';' | Where-Object { $_ }
+    $alreadyPersisted = $false
+    foreach ($d in $userDirs) {
+        try {
+            if ([System.IO.Path]::GetFullPath($d) -eq [System.IO.Path]::GetFullPath($Directory)) {
+                $alreadyPersisted = $true
+                break
+            }
+        } catch { }
+    }
+    if (-not $alreadyPersisted) {
+        $newUserPath = if ($userPath) { $userPath + ';' + $Directory } else { $Directory }
+        [System.Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+    }
+    # Add to current session
+    $env:Path += ';' + $Directory
+    return $true
+}
+
+function Get-NpmGlobalBin {
+    <# Returns the npm global bin directory, or $null. #>
+    if (-not (Test-CommandExists 'npm')) { return $null }
+    try {
+        $prefix = (& npm prefix -g 2>&1 | Out-String).Trim()
+        if ($prefix -and (Test-Path $prefix)) { return $prefix }
+    } catch {}
+    # Fallback: common Windows location
+    $fallback = Join-Path $env:APPDATA 'npm'
+    if (Test-Path $fallback) { return $fallback }
+    return $null
+}
+
+function Find-InKnownLocations {
+    <#
+        Searches known install directories for a tool binary.
+        Returns the directory containing the binary, or $null.
+    #>
+    param([string]$ToolName)
+
+    $candidates = @()
+    switch ($ToolName) {
+        'git' {
+            $candidates = @(
+                (Join-Path $env:ProgramFiles 'Git\cmd')
+                (Join-Path ${env:ProgramFiles(x86)} 'Git\cmd')
+                (Join-Path $env:LOCALAPPDATA 'Programs\Git\cmd')
+            )
+        }
+        'node' {
+            $candidates = @(
+                (Join-Path $env:ProgramFiles 'nodejs')
+                (Join-Path ${env:ProgramFiles(x86)} 'nodejs')
+                (Join-Path $env:LOCALAPPDATA 'Programs\nodejs')
+            )
+        }
+        'gh' {
+            $candidates = @(
+                (Join-Path $env:ProgramFiles 'GitHub CLI')
+                (Join-Path ${env:ProgramFiles(x86)} 'GitHub CLI')
+                (Join-Path $env:LOCALAPPDATA 'Programs\GitHub CLI')
+            )
+        }
+        'claude' {
+            $candidates = @(
+                (Join-Path $env:USERPROFILE '.local\bin')
+                (Join-Path $env:LOCALAPPDATA 'Programs\claude')
+                (Join-Path $env:APPDATA 'Claude\bin')
+            )
+        }
+        { $_ -in @('copilot', 'codex', 'gemini') } {
+            # npm global bin directories
+            $npmBin = Get-NpmGlobalBin
+            if ($npmBin) {
+                $candidates = @($npmBin)
+            }
+            $roamingNpm = Join-Path $env:APPDATA 'npm'
+            if ($roamingNpm -and ($candidates -notcontains $roamingNpm)) {
+                $candidates += $roamingNpm
+            }
+        }
+    }
+
+    $exeName = "$ToolName.exe"
+    # For node, npm ships as node.exe; for gh, binary is gh.exe; etc.
+    foreach ($dir in $candidates) {
+        if (-not $dir) { continue }
+        $fullPath = Join-Path $dir $exeName
+        if (Test-Path $fullPath) {
+            return $dir
+        }
+        # Also check .cmd shims (npm installs .cmd wrappers)
+        $cmdPath = Join-Path $dir "$ToolName.cmd"
+        if (Test-Path $cmdPath) {
+            return $dir
+        }
+    }
+    return $null
+}
+
+function Resolve-Tool {
+    <#
+        Full resolution flow for a tool:
+        1. Check PATH via Get-Command
+        2. If not found, check known install locations
+        3. If found off-PATH, fix PATH permanently + session
+        Returns a hashtable: @{ Found = $bool; FixedPath = $bool; Dir = $string }
+    #>
+    param([string]$Command)
+
+    # Step 1: already in PATH
+    if (Test-CommandExists $Command) {
+        return @{ Found = $true; FixedPath = $false; Dir = $null }
+    }
+
+    # Step 2: check known locations
+    $dir = Find-InKnownLocations -ToolName $Command
+    if ($dir) {
+        # Step 3: fix PATH
+        Add-ToUserPath -Directory $dir | Out-Null
+        # Verify it works now
+        if (Test-CommandExists $Command) {
+            return @{ Found = $true; FixedPath = $true; Dir = $dir }
+        }
+    }
+
+    return @{ Found = $false; FixedPath = $false; Dir = $null }
+}
+
+function Test-WingetAvailable {
+    return (Test-CommandExists 'winget')
+}
+
+function Install-WithWinget {
+    param([string]$PackageId, [string]$DisplayName)
+    if (-not (Test-WingetAvailable)) {
+        Write-Warn "$DisplayName not found. Install winget (aka App Installer) from the Microsoft Store, then install $DisplayName manually."
+        return $false
+    }
+    try {
+        Write-Step "Installing $DisplayName via winget..."
+        $output = & winget install $PackageId --accept-source-agreements --accept-package-agreements 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -and $output -notmatch 'already installed') {
+            Write-Warn "winget install $PackageId exited with code $LASTEXITCODE"
+            return $false
+        }
+        Refresh-Path
+        return $true
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        Write-Warn "Failed to install $DisplayName`: $errMsg"
+        return $false
+    }
+}
+
+function Install-WithNpm {
+    param([string]$PackageName, [string]$DisplayName)
+    if (-not (Test-CommandExists 'npm')) {
+        Write-Warn "npm not available - cannot install $DisplayName. Install Node.js first."
+        return $false
+    }
+    try {
+        Write-Step "Installing $DisplayName via npm..."
+        $output = & npm install -g $PackageName 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "npm install -g $PackageName failed (exit code $LASTEXITCODE)"
+            return $false
+        }
+        # Ensure npm global bin is in PATH permanently
+        $npmBin = Get-NpmGlobalBin
+        if ($npmBin) {
+            Add-ToUserPath -Directory $npmBin | Out-Null
+        }
+        return $true
+    }
+    catch {
+        $errMsg = $_.Exception.Message
+        Write-Warn "Failed to install $DisplayName`: $errMsg"
+        return $false
+    }
+}
+
+function Install-Prerequisites {
+    Write-Host ""
+    Write-Host "  ── Prerequisites ──────────────────────────────" -ForegroundColor Cyan
+    Write-Host ""
+
+    $script:prereqResults = @()
+
+    # ── 1. Git ────────────────────────────────────────────────────────────────
+    $res = Resolve-Tool -Command 'git'
+    if ($res.Found -and $res.FixedPath) {
+        $ver = Get-CommandVersion 'git' @('--version')
+        Write-Status "Git" "v$ver (found, fixed PATH)" -Color Yellow
+        $script:prereqResults += @{ Name = 'Git'; Version = "v$ver"; Status = 'path-fixed' }
+    }
+    elseif ($res.Found) {
+        $ver = Get-CommandVersion 'git' @('--version')
+        Write-Status "Git" "v$ver (already installed)" -Color Green
+        $script:prereqResults += @{ Name = 'Git'; Version = "v$ver"; Status = 'present' }
+    }
+    else {
+        if (Install-WithWinget 'Git.Git' 'Git') {
+            Refresh-Path
+            # Post-install: resolve again in case winget didn't update PATH
+            $post = Resolve-Tool -Command 'git'
+            $ver = Get-CommandVersion 'git' @('--version')
+            if ($ver) {
+                Write-Status "Git" "v$ver (installed)" -Color Green
+                $script:prereqResults += @{ Name = 'Git'; Version = "v$ver"; Status = 'installed' }
+            }
+            else {
+                Write-Status "Git" "installed but not in PATH" -Color Yellow
+                $script:prereqResults += @{ Name = 'Git'; Version = $null; Status = 'installed' }
+            }
+        }
+        else {
+            Write-Status "Git" "not installed" -Color Red
+            $script:prereqResults += @{ Name = 'Git'; Version = $null; Status = 'failed' }
+        }
+    }
+
+    # ── 2. Node.js ────────────────────────────────────────────────────────────
+    $res = Resolve-Tool -Command 'node'
+    if ($res.Found -and $res.FixedPath) {
+        $ver = Get-CommandVersion 'node' @('--version')
+        Write-Status "Node.js" "v$ver (found, fixed PATH)" -Color Yellow
+        $script:prereqResults += @{ Name = 'Node.js'; Version = "v$ver"; Status = 'path-fixed' }
+    }
+    elseif ($res.Found) {
+        $ver = Get-CommandVersion 'node' @('--version')
+        Write-Status "Node.js" "v$ver (already installed)" -Color Green
+        $script:prereqResults += @{ Name = 'Node.js'; Version = "v$ver"; Status = 'present' }
+    }
+    else {
+        if (Install-WithWinget 'OpenJS.NodeJS.LTS' 'Node.js') {
+            Refresh-Path
+            $post = Resolve-Tool -Command 'node'
+            $ver = Get-CommandVersion 'node' @('--version')
+            if ($ver) {
+                Write-Status "Node.js" "v$ver (installed)" -Color Green
+                $script:prereqResults += @{ Name = 'Node.js'; Version = "v$ver"; Status = 'installed' }
+            }
+            else {
+                Write-Status "Node.js" "installed but not in PATH" -Color Yellow
+                $script:prereqResults += @{ Name = 'Node.js'; Version = $null; Status = 'installed' }
+            }
+        }
+        else {
+            Write-Status "Node.js" "not installed" -Color Red
+            $script:prereqResults += @{ Name = 'Node.js'; Version = $null; Status = 'failed' }
+        }
+    }
+
+    # ── 3. GitHub CLI ─────────────────────────────────────────────────────────
+    $res = Resolve-Tool -Command 'gh'
+    if ($res.Found -and $res.FixedPath) {
+        $ver = Get-CommandVersion 'gh' @('--version')
+        Write-Status "GitHub CLI" "v$ver (found, fixed PATH)" -Color Yellow
+        $script:prereqResults += @{ Name = 'GitHub CLI'; Version = "v$ver"; Status = 'path-fixed' }
+    }
+    elseif ($res.Found) {
+        $ver = Get-CommandVersion 'gh' @('--version')
+        Write-Status "GitHub CLI" "v$ver (already installed)" -Color Green
+        $script:prereqResults += @{ Name = 'GitHub CLI'; Version = "v$ver"; Status = 'present' }
+    }
+    else {
+        if (Install-WithWinget 'GitHub.GitHubCLI' 'GitHub CLI') {
+            Refresh-Path
+            $post = Resolve-Tool -Command 'gh'
+            $ver = Get-CommandVersion 'gh' @('--version')
+            if ($ver) {
+                Write-Status "GitHub CLI" "v$ver (installed)" -Color Green
+                $script:prereqResults += @{ Name = 'GitHub CLI'; Version = "v$ver"; Status = 'installed' }
+            }
+            else {
+                Write-Status "GitHub CLI" "installed but not in PATH" -Color Yellow
+                $script:prereqResults += @{ Name = 'GitHub CLI'; Version = $null; Status = 'installed' }
+            }
+        }
+        else {
+            Write-Status "GitHub CLI" "not installed" -Color Red
+            $script:prereqResults += @{ Name = 'GitHub CLI'; Version = $null; Status = 'failed' }
+        }
+    }
+
+    # ── 4. Claude Code ────────────────────────────────────────────────────────
+    $res = Resolve-Tool -Command 'claude'
+    if ($res.Found -and $res.FixedPath) {
+        $ver = Get-CommandVersion 'claude' @('--version')
+        Write-Status "Claude Code" "v$ver (found, fixed PATH)" -Color Yellow
+        $script:prereqResults += @{ Name = 'Claude Code'; Version = "v$ver"; Status = 'path-fixed' }
+    }
+    elseif ($res.Found) {
+        $ver = Get-CommandVersion 'claude' @('--version')
+        Write-Status "Claude Code" "v$ver (already installed)" -Color Green
+        $script:prereqResults += @{ Name = 'Claude Code'; Version = "v$ver"; Status = 'present' }
+    }
+    else {
+        try {
+            Write-Step "Installing Claude Code via official installer..."
+            $installerScript = Invoke-RestMethod -Uri 'https://claude.ai/install.ps1' -UseBasicParsing
+            Invoke-Expression $installerScript
+            Refresh-Path
+            # The official installer puts claude in ~/.local/bin; resolve again
+            $post = Resolve-Tool -Command 'claude'
+            if ($post.Found) {
+                $ver = Get-CommandVersion 'claude' @('--version')
+                $msg = if ($post.FixedPath) { "v$ver (installed, fixed PATH)" } else { "v$ver (installed)" }
+                Write-Status "Claude Code" $msg -Color Green
+                $script:prereqResults += @{ Name = 'Claude Code'; Version = "v$ver"; Status = 'installed' }
+            }
+            else {
+                Write-Status "Claude Code" "installer ran but command not found" -Color Yellow
+                $script:prereqResults += @{ Name = 'Claude Code'; Version = $null; Status = 'failed' }
+            }
+        }
+        catch {
+            $errMsg = $_.Exception.Message
+            Write-Warn "Failed to install Claude Code: $errMsg"
+            Write-Status "Claude Code" "not installed" -Color Red
+            $script:prereqResults += @{ Name = 'Claude Code'; Version = $null; Status = 'failed' }
+        }
+    }
+
+    # ── npm global bin PATH fix ───────────────────────────────────────────────
+    # Before checking npm-based tools, ensure the npm global bin dir is in PATH.
+    if (Test-CommandExists 'npm') {
+        $npmBin = Get-NpmGlobalBin
+        if ($npmBin -and (Test-Path $npmBin)) {
+            $added = Add-ToUserPath -Directory $npmBin
+            if ($added) {
+                Write-Step "Added npm global bin to PATH: $npmBin"
+            }
+        }
+    }
+
+    # ── npm-based CLI tools (require Node.js) ─────────────────────────────────
+    $hasNode = Test-CommandExists 'node'
+    if (-not $hasNode) {
+        Write-Warn "Node.js is not available - skipping npm-based CLI tools (Copilot, Codex, Gemini)."
+        foreach ($name in @('Copilot CLI', 'Codex CLI', 'Gemini CLI')) {
+            Write-Status $name "skipped (no Node.js)" -Color DarkGray
+            $script:prereqResults += @{ Name = $name; Version = $null; Status = 'skipped' }
+        }
+    }
+    else {
+        # ── 5. GitHub Copilot CLI ─────────────────────────────────────────────
+        $res = Resolve-Tool -Command 'copilot'
+        if ($res.Found -and $res.FixedPath) {
+            $ver = Get-CommandVersion 'copilot' @('--version')
+            Write-Status "Copilot CLI" "v$ver (found, fixed PATH)" -Color Yellow
+            $script:prereqResults += @{ Name = 'Copilot CLI'; Version = "v$ver"; Status = 'path-fixed' }
+        }
+        elseif ($res.Found) {
+            $ver = Get-CommandVersion 'copilot' @('--version')
+            Write-Status "Copilot CLI" "v$ver (already installed)" -Color Green
+            $script:prereqResults += @{ Name = 'Copilot CLI'; Version = "v$ver"; Status = 'present' }
+        }
+        else {
+            if (Install-WithNpm '@github/copilot' 'Copilot CLI') {
+                Refresh-Path
+                $post = Resolve-Tool -Command 'copilot'
+                $ver = Get-CommandVersion 'copilot' @('--version')
+                if ($ver) {
+                    Write-Status "Copilot CLI" "v$ver (installed)" -Color Green
+                    $script:prereqResults += @{ Name = 'Copilot CLI'; Version = "v$ver"; Status = 'installed' }
+                }
+                else {
+                    Write-Status "Copilot CLI" "installed but not in PATH" -Color Yellow
+                    $script:prereqResults += @{ Name = 'Copilot CLI'; Version = $null; Status = 'installed' }
+                }
+            }
+            else {
+                Write-Status "Copilot CLI" "not installed" -Color Red
+                $script:prereqResults += @{ Name = 'Copilot CLI'; Version = $null; Status = 'failed' }
+            }
+        }
+
+        # ── 6. Codex CLI ─────────────────────────────────────────────────────
+        $res = Resolve-Tool -Command 'codex'
+        if ($res.Found -and $res.FixedPath) {
+            $ver = Get-CommandVersion 'codex' @('--version')
+            Write-Status "Codex CLI" "v$ver (found, fixed PATH)" -Color Yellow
+            $script:prereqResults += @{ Name = 'Codex CLI'; Version = "v$ver"; Status = 'path-fixed' }
+        }
+        elseif ($res.Found) {
+            $ver = Get-CommandVersion 'codex' @('--version')
+            Write-Status "Codex CLI" "v$ver (already installed)" -Color Green
+            $script:prereqResults += @{ Name = 'Codex CLI'; Version = "v$ver"; Status = 'present' }
+        }
+        else {
+            if (Install-WithNpm '@openai/codex' 'Codex CLI') {
+                Refresh-Path
+                $post = Resolve-Tool -Command 'codex'
+                $ver = Get-CommandVersion 'codex' @('--version')
+                if ($ver) {
+                    Write-Status "Codex CLI" "v$ver (installed)" -Color Green
+                    $script:prereqResults += @{ Name = 'Codex CLI'; Version = "v$ver"; Status = 'installed' }
+                }
+                else {
+                    Write-Status "Codex CLI" "installed but not in PATH" -Color Yellow
+                    $script:prereqResults += @{ Name = 'Codex CLI'; Version = $null; Status = 'installed' }
+                }
+            }
+            else {
+                Write-Status "Codex CLI" "not installed" -Color Red
+                $script:prereqResults += @{ Name = 'Codex CLI'; Version = $null; Status = 'failed' }
+            }
+        }
+
+        # ── 7. Gemini CLI ────────────────────────────────────────────────────
+        $res = Resolve-Tool -Command 'gemini'
+        if ($res.Found -and $res.FixedPath) {
+            $ver = Get-CommandVersion 'gemini' @('--version')
+            Write-Status "Gemini CLI" "v$ver (found, fixed PATH)" -Color Yellow
+            $script:prereqResults += @{ Name = 'Gemini CLI'; Version = "v$ver"; Status = 'path-fixed' }
+        }
+        elseif ($res.Found) {
+            $ver = Get-CommandVersion 'gemini' @('--version')
+            Write-Status "Gemini CLI" "v$ver (already installed)" -Color Green
+            $script:prereqResults += @{ Name = 'Gemini CLI'; Version = "v$ver"; Status = 'present' }
+        }
+        else {
+            if (Install-WithNpm '@google/gemini-cli' 'Gemini CLI') {
+                Refresh-Path
+                $post = Resolve-Tool -Command 'gemini'
+                $ver = Get-CommandVersion 'gemini' @('--version')
+                if ($ver) {
+                    Write-Status "Gemini CLI" "v$ver (installed)" -Color Green
+                    $script:prereqResults += @{ Name = 'Gemini CLI'; Version = "v$ver"; Status = 'installed' }
+                }
+                else {
+                    Write-Status "Gemini CLI" "installed but not in PATH" -Color Yellow
+                    $script:prereqResults += @{ Name = 'Gemini CLI'; Version = $null; Status = 'installed' }
+                }
+            }
+            else {
+                Write-Status "Gemini CLI" "not installed" -Color Red
+                $script:prereqResults += @{ Name = 'Gemini CLI'; Version = $null; Status = 'failed' }
+            }
+        }
+    }
+
+    Write-Host ""
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 function Install-Bob {
@@ -540,6 +1041,15 @@ function Install-Bob {
 
     Write-Status "Installing" "done" -Color Green
 
+    # ── Prerequisites (CLI agents) ────────────────────────────────────────────
+    if (-not $SkipPrereqs) {
+        Install-Prerequisites
+    }
+    else {
+        Write-Host ""
+        Write-Step "Skipping prerequisites (-SkipPrereqs specified)"
+    }
+
     # ── Verify installation ───────────────────────────────────────────────────
     $finalPath = Find-ExistingInstall
     $finalVersion = if ($finalPath) { Get-InstalledVersion -ExePath $finalPath } else { $null }
@@ -561,6 +1071,32 @@ function Install-Bob {
     Write-Host ""
     Write-Host "  Install path:  " -NoNewline
     Write-Host $displayPath -ForegroundColor Cyan
+
+    # Show summary of prerequisites
+    if (-not $SkipPrereqs -and $script:prereqResults -and $script:prereqResults.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  CLI agents:" -ForegroundColor Cyan
+        foreach ($r in $script:prereqResults) {
+            $icon = switch ($r.Status) {
+                'present'    { '[=]'; break }
+                'installed'  { '[+]'; break }
+                'path-fixed' { '[~]'; break }
+                'skipped'    { '[-]'; break }
+                default      { '[!]'; break }
+            }
+            $color = switch ($r.Status) {
+                'present'    { 'Green';     break }
+                'installed'  { 'Green';     break }
+                'path-fixed' { 'Yellow';    break }
+                'skipped'    { 'DarkGray';  break }
+                default      { 'Yellow';    break }
+            }
+            $detail = if ($r.Version) { $r.Version } else { $r.Status }
+            Write-Host "    $icon " -ForegroundColor $color -NoNewline
+            Write-Host "$($r.Name): $detail"
+        }
+    }
+
     Write-Host ""
     Write-Host "  Launch Bob from the Start Menu or run: " -NoNewline
     Write-Host "Bob" -ForegroundColor Green
