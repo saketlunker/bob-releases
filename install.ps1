@@ -980,7 +980,8 @@ function Install-Bob {
     Write-Status "Target version" "v$targetVersion" -Color Green
 
     # ── Version comparison ────────────────────────────────────────────────────
-    if ($installedVersion -and -not $Force) {
+    $isForced = $Force -or ($env:BOB_FORCE -eq '1')
+    if ($installedVersion -and -not $isForced) {
         $cmp = Compare-SemVer -Left $installedVersion -Right $targetVersion
         if ($cmp -ge 0) {
             Write-Host ""
@@ -992,9 +993,9 @@ function Install-Bob {
                 Write-Host "newer than v$targetVersion" -ForegroundColor Green -NoNewline
             }
             Write-Host "."
-            Write-Host "  Use " -NoNewline
-            Write-Host "-Force" -ForegroundColor Yellow -NoNewline
-            Write-Host " to reinstall."
+            Write-Host '  Run: ' -NoNewline
+            Write-Host '$env:BOB_FORCE=1; irm .../install.ps1 | iex' -ForegroundColor Yellow -NoNewline
+            Write-Host ' to reinstall.'
             Write-Host ""
             return
         }
