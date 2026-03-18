@@ -355,57 +355,11 @@ function Invoke-Download {
         [long]$ExpectedSize
     )
 
-    # Use .NET HttpClient with manual progress for ALL PowerShell versions
-    # This gives a clean inline progress bar instead of the ugly default
-    try {
-        $wc = [System.Net.WebClient]::new()
-        $wc.Headers.Add('User-Agent', 'Bob-Installer/1.0')
-
-        $downloadComplete = $false
-        $lastPercent = -1
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-
-        $progressHandler = {
-            param($sender, $e)
-            if ($e.ProgressPercentage -ne $script:lastPercent) {
-                $script:lastPercent = $e.ProgressPercentage
-                $filled = [math]::Floor($e.ProgressPercentage / 4)
-                $empty  = 25 - $filled
-                $bar    = ([char]0x2588).ToString() * $filled + ([char]0x2591).ToString() * $empty
-                $sizeMB = [math]::Round($e.TotalBytesToReceive / 1MB, 1)
-                $recvMB = [math]::Round($e.BytesReceived / 1MB, 1)
-                $elapsed = $script:sw.Elapsed
-                $speed = if ($elapsed.TotalSeconds -gt 0) { [math]::Round($e.BytesReceived / $elapsed.TotalSeconds / 1MB, 1) } else { 0 }
-                Write-Host "`r  $bar $($e.ProgressPercentage)%%  $recvMB / $sizeMB MB  ($speed MB/s)   " -NoNewline
-            }
-        }
-        $completedHandler = {
-            param($sender, $e)
-            $script:downloadComplete = $true
-        }
-
-        $wc.add_DownloadProgressChanged($progressHandler)
-        $wc.add_DownloadFileCompleted($completedHandler)
-
-        $wc.DownloadFileAsync([uri]$Url, $OutFile)
-
-        while (-not $downloadComplete) {
-            Start-Sleep -Milliseconds 250
-        }
-
-        $sw.Stop()
-        Write-Host ""  # newline after progress bar
-
-        if ($wc.IsBusy) { $wc.CancelAsync() }
-        $wc.Dispose()
-    }
-    catch {
-        # Fallback to Invoke-WebRequest
-        Write-Warn "Download with progress failed, falling back..."
-        $ProgressPreference = 'Continue'
-        $headers = @{ 'User-Agent' = 'Bob-Installer/1.0' }
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile -Headers $headers -UseBasicParsing
-    }
+    # Simple, reliable download with built-in progress
+    # WebClient async crashes PS7 when invoked via iex (no runspace on threadpool)
+    $ProgressPreference = 'Continue'
+    $headers = @{ 'User-Agent' = 'Bob-Installer/1.0' }
+    Invoke-WebRequest -Uri $Url -OutFile $OutFile -Headers $headers -UseBasicParsing
 }
 
 function Format-FileSize {
