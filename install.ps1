@@ -21,14 +21,23 @@
     # Install latest version:
     irm https://raw.githubusercontent.com/saketlunker/bob-releases/main/install.ps1 | iex
 
+    # Force reinstall:
+    $env:BOB_FORCE=1; irm https://raw.githubusercontent.com/saketlunker/bob-releases/main/install.ps1 | iex
+
     # Install a specific version:
-    & { param($Version) irm https://raw.githubusercontent.com/saketlunker/bob-releases/main/install.ps1 | iex } -Version "1.2.0"
+    $env:BOB_VERSION="1.2.0"; irm https://raw.githubusercontent.com/saketlunker/bob-releases/main/install.ps1 | iex
 #>
 param(
     [string]$Version,
     [switch]$Force,
     [switch]$SkipPrereqs
 )
+
+# When piped via `irm | iex`, params can't be passed directly.
+# Support env vars as fallback: $env:BOB_FORCE=1, $env:BOB_VERSION="1.2.0"
+if ($env:BOB_FORCE -eq '1') { $Force = [switch]::Present }
+if ($env:BOB_VERSION -and -not $Version) { $Version = $env:BOB_VERSION }
+if ($env:BOB_SKIP_PREREQS -eq '1') { $SkipPrereqs = [switch]::Present }
 
 $ErrorActionPreference = 'Stop'
 
@@ -164,7 +173,15 @@ function Normalize-Version {
     if (-not $Ver) { return $null }
     $v = $Ver.Trim()
     if ($v.StartsWith('v')) { $v = $v.Substring(1) }
-    return $v
+    # Strip trailing .0 segments so 1.0.0.0 == 1.0.0
+    while ($v -match '\.\d+$' -and ($v -split '\.').Count -gt 3) {
+        $v = $v -replace '\.\d+$', ''
+    }
+    # Normalize to exactly 3 parts (major.minor.patch)
+    $parts = $v -split '\.'
+    while ($parts.Count -lt 3) { $parts += '0' }
+    if ($parts.Count -gt 3) { $parts = $parts[0..2] }
+    return ($parts[0..2] -join '.')
 }
 
 function Compare-SemVer {
