@@ -338,62 +338,56 @@ function Invoke-Download {
         [long]$ExpectedSize
     )
 
-    $headers = @{ 'User-Agent' = 'Bob-Installer/1.0' }
+    # Use .NET HttpClient with manual progress for ALL PowerShell versions
+    # This gives a clean inline progress bar instead of the ugly default
+    try {
+        $wc = [System.Net.WebClient]::new()
+        $wc.Headers.Add('User-Agent', 'Bob-Installer/1.0')
 
-    # Use .NET WebClient for progress on PS 5.1, Invoke-WebRequest on PS 7+
-    $isPSCore = $PSVersionTable.PSVersion.Major -ge 7
+        $downloadComplete = $false
+        $lastPercent = -1
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    if ($isPSCore) {
-        # PowerShell 7+ has native progress with Invoke-WebRequest
-        $ProgressPreference = 'Continue'
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile -Headers $headers -UseBasicParsing
+        $progressHandler = {
+            param($sender, $e)
+            if ($e.ProgressPercentage -ne $script:lastPercent) {
+                $script:lastPercent = $e.ProgressPercentage
+                $filled = [math]::Floor($e.ProgressPercentage / 4)
+                $empty  = 25 - $filled
+                $bar    = ([char]0x2588).ToString() * $filled + ([char]0x2591).ToString() * $empty
+                $sizeMB = [math]::Round($e.TotalBytesToReceive / 1MB, 1)
+                $recvMB = [math]::Round($e.BytesReceived / 1MB, 1)
+                $elapsed = $script:sw.Elapsed
+                $speed = if ($elapsed.TotalSeconds -gt 0) { [math]::Round($e.BytesReceived / $elapsed.TotalSeconds / 1MB, 1) } else { 0 }
+                Write-Host "`r  $bar $($e.ProgressPercentage)%%  $recvMB / $sizeMB MB  ($speed MB/s)   " -NoNewline
+            }
+        }
+        $completedHandler = {
+            param($sender, $e)
+            $script:downloadComplete = $true
+        }
+
+        $wc.add_DownloadProgressChanged($progressHandler)
+        $wc.add_DownloadFileCompleted($completedHandler)
+
+        $wc.DownloadFileAsync([uri]$Url, $OutFile)
+
+        while (-not $downloadComplete) {
+            Start-Sleep -Milliseconds 250
+        }
+
+        $sw.Stop()
+        Write-Host ""  # newline after progress bar
+
+        if ($wc.IsBusy) { $wc.CancelAsync() }
+        $wc.Dispose()
     }
-    else {
-        # PowerShell 5.1: use System.Net.WebClient for better progress
-        try {
-            $wc = [System.Net.WebClient]::new()
-            $wc.Headers.Add('User-Agent', 'Bob-Installer/1.0')
-
-            $downloadComplete = $false
-            $lastPercent = -1
-
-            $progressHandler = {
-                param($sender, $e)
-                if ($e.ProgressPercentage -ne $script:lastPercent) {
-                    $script:lastPercent = $e.ProgressPercentage
-                    $filled = [math]::Floor($e.ProgressPercentage / 4)
-                    $empty  = 25 - $filled
-                    $bar    = ('#' * $filled) + ('-' * $empty)
-                    $sizeMB = [math]::Round($e.TotalBytesToReceive / 1MB, 1)
-                    $recvMB = [math]::Round($e.BytesReceived / 1MB, 1)
-                    Write-Host "`r  [$bar] $($e.ProgressPercentage)%  ($recvMB / $sizeMB MB)" -NoNewline
-                }
-            }
-            $completedHandler = {
-                param($sender, $e)
-                $script:downloadComplete = $true
-            }
-
-            $wc.add_DownloadProgressChanged($progressHandler)
-            $wc.add_DownloadFileCompleted($completedHandler)
-
-            $wc.DownloadFileAsync([uri]$Url, $OutFile)
-
-            while (-not $downloadComplete) {
-                Start-Sleep -Milliseconds 250
-            }
-
-            Write-Host ""  # newline after progress bar
-
-            if ($wc.IsBusy) { $wc.CancelAsync() }
-            $wc.Dispose()
-        }
-        catch {
-            # Fallback to Invoke-WebRequest
-            Write-Warn "WebClient download failed, falling back to Invoke-WebRequest..."
-            $ProgressPreference = 'Continue'
-            Invoke-WebRequest -Uri $Url -OutFile $OutFile -Headers $headers -UseBasicParsing
-        }
+    catch {
+        # Fallback to Invoke-WebRequest
+        Write-Warn "Download with progress failed, falling back..."
+        $ProgressPreference = 'Continue'
+        $headers = @{ 'User-Agent' = 'Bob-Installer/1.0' }
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -Headers $headers -UseBasicParsing
     }
 }
 
@@ -424,9 +418,21 @@ function Test-CommandExists {
 }
 
 function Get-CommandVersion {
-    param([string]$Command, [string[]]$Args = @('--version'))
+    param([string]$Command, [string[]]$VersionArgs = @('--version'))
     try {
-        $output = & $Command @Args 2>&1 | Out-String
+        # Use Start-Process with timeout to avoid hangs
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = (Get-Command $Command -ErrorAction SilentlyContinue).Source
+        if (-not $pinfo.FileName) { $pinfo.FileName = $Command }
+        $pinfo.Arguments = $VersionArgs -join ' '
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($pinfo)
+        $output = $p.StandardOutput.ReadToEnd()
+        $waited = $p.WaitForExit(10000)  # 10 second timeout
+        if (-not $waited) { try { $p.Kill() } catch {} }
         if ($output -match '(\d+\.\d+[\.\d]*)') {
             return $Matches[1]
         }
@@ -593,10 +599,15 @@ function Install-WithWinget {
     }
     try {
         Write-Step "Installing $DisplayName via winget..."
-        $output = & winget install $PackageId --accept-source-agreements --accept-package-agreements 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0 -and $output -notmatch 'already installed') {
-            Write-Warn "winget install $PackageId exited with code $LASTEXITCODE"
+        $proc = Start-Process -FilePath 'winget' -ArgumentList "install $PackageId --accept-source-agreements --accept-package-agreements --silent" -PassThru -NoNewWindow -Wait:$false
+        $completed = $proc.WaitForExit(120000)  # 2 minute timeout
+        if (-not $completed) {
+            try { $proc.Kill() } catch {}
+            Write-Warn "winget install $DisplayName timed out after 2 minutes"
             return $false
+        }
+        if ($proc.ExitCode -ne 0) {
+            Write-Warn "winget install $PackageId exited with code $($proc.ExitCode)"
         }
         Refresh-Path
         return $true
@@ -616,9 +627,15 @@ function Install-WithNpm {
     }
     try {
         Write-Step "Installing $DisplayName via npm..."
-        $output = & npm install -g $PackageName 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "npm install -g $PackageName failed (exit code $LASTEXITCODE)"
+        $proc = Start-Process -FilePath 'npm' -ArgumentList "install -g $PackageName" -PassThru -NoNewWindow -Wait:$false
+        $completed = $proc.WaitForExit(120000)  # 2 minute timeout
+        if (-not $completed) {
+            try { $proc.Kill() } catch {}
+            Write-Warn "npm install $DisplayName timed out after 2 minutes"
+            return $false
+        }
+        if ($proc.ExitCode -ne 0) {
+            Write-Warn "npm install -g $PackageName failed (exit code $($proc.ExitCode))"
             return $false
         }
         # Ensure npm global bin is in PATH permanently
